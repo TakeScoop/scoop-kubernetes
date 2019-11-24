@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strings"
 
+	"golang.org/x/net/proxy"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -129,6 +130,18 @@ func (s *SpdyRoundTripper) dial(req *http.Request) (net.Conn, error) {
 		return s.dialWithoutProxy(req.Context(), req.URL)
 	}
 
+	switch proxyURL.Scheme {
+	case "socks5":
+		return s.dialWithSocks5Proxy(req.URL, proxyURL)
+	case "https", "http":
+		return s.dialWithHttpProxy(req.URL, proxyURL)
+	}
+
+	return nil, fmt.Errorf("proxy URL scheme not supported: %s", proxyURL.Scheme)
+}
+
+// dialWithoutProxy dials the host specified by url through an http or an https proxy.
+func (s *SpdyRoundTripper) dialWithHttpProxy(requestUrl *url.URL, proxyURL *url.URL) (net.Conn, error) {
 	// ensure we use a canonical host with proxyReq
 	targetHost := netutil.CanonicalAddr(req.URL)
 
@@ -157,7 +170,34 @@ func (s *SpdyRoundTripper) dial(req *http.Request) (net.Conn, error) {
 
 	rwc, _ := proxyClientConn.Hijack()
 
-	if req.URL.Scheme != "https" {
+	return s.tlsConn(req.URL, rwc, targetHost)
+}
+
+// dialWithoutProxy dials the host specified by url through a socks5 proxy.
+func (s *SpdyRoundTripper) dialWithSocks5Proxy(requestUrl *url.URL, proxyURL *url.URL) (net.Conn, error) {
+	// ensure we use a canonical host with proxyReq
+	targetHost := netutil.CanonicalAddr(requestUrl)
+
+	proxyDialAddr := netutil.CanonicalAddr(proxyURL)
+	proxyDialer, err := proxy.SOCKS5("tcp", proxyDialAddr, nil, proxy.Direct)
+
+	proxyConn, err := proxyDialer.Dial("tcp", targetHost)
+
+	if err != nil {
+		return nil, err
+	}
+
+	proxyClientConn := httputil.NewProxyClientConn(proxyConn, nil)
+
+	rwc, _ := proxyClientConn.Hijack()
+
+	return s.tlsConn(requestUrl, rwc, targetHost)
+}
+
+// tlsConn returns a TLS client side connection using rwc as the underlying transport.
+func (s *SpdyRoundTripper) tlsConn(requestUrl *url.URL, rwc net.Conn, targetHost string) (net.Conn, error) {
+
+	if requestUrl.Scheme != "https" {
 		return rwc, nil
 	}
 
